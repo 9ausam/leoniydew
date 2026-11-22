@@ -1,0 +1,165 @@
+name: Build (Android, iOS, Windows)
+
+# Builds only the no-sounds versions:
+#   Android  leoniydew-android-<version>-arm-base.apk
+#   iOS      leoniydew-ios-<version>-no-sounds.ipa   (unsigned: AltStore / SideStore / Sideloadly)
+#   Windows  leoniydew-<tag>-windows-x86_64-no-sounds.zip   (leoniydew-native.exe inside)
+# The sounds are downloaded by the app from the repository's `sounds-<version>` release, so none are bundled here.
+#
+# Run it by hand (Actions > Build > Run workflow): the files are in the run's Artifacts.
+# Or push a tag (git tag v0.5.5 && git push origin v0.5.5): the files are also attached to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.91.0
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          umask 077
+          ks="$RUNNER_TEMP/leoniydew-release.jks"
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ks"
+            echo "Using the signing key from the repository secrets."
+            echo "KS_PASS=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "KS_KEYPASS=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No Android signing secrets set: signing with a throwaway key made for this run. The APK installs, but a later build (other key) cannot update it: uninstall first, or add the 4 secrets (see GITHUB_BUILD.md)."
+            pass=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)
+            keytool -genkeypair -noprompt -keystore "$ks" -storetype PKCS12 \
+              -storepass "$pass" -keypass "$pass" -alias leoniydew -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=Leoniydew,O=Leoniydew,C=US'
+            echo "::add-mask::$pass"
+            echo "KS_PASS=$pass" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=leoniydew" >> "$GITHUB_ENV"
+            echo "KS_KEYPASS=$pass" >> "$GITHUB_ENV"
+          fi
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-linux-android, armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Android build tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y libclang-dev
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.0.13004108'
+          cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Build signed APK (without sounds)
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/leoniydew-release.jks
+        run: |
+          export ANDROID_KEYSTORE_PASSWORD="$KS_PASS" ANDROID_KEY_ALIAS="$KS_ALIAS" ANDROID_KEY_PASSWORD="$KS_KEYPASS"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
+          chmod +x tools/android-dist.sh android/gradlew
+          tools/android-dist.sh --release
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/leoniydew-release.jks"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: target/leoniydew-android-*-arm-base.apk
+          if-no-files-found: error
+          compression-level: 0
+
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+      - run: |
+          chmod +x tools/ios-dist.sh
+          tools/ios-dist.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: target/leoniydew-ios-*-no-sounds.ipa
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+      # signalsmith-stretch (Lemon Sampler's time stretching) compiles C++ and runs bindgen, which loads libclang.
+      - name: libclang
+        shell: pwsh
+        run: |
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path "$llvm\libclang.dll")) { choco install llvm -y --no-progress }
+          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc --bins
+      - name: Package (zip with the .exe inside)
+        shell: bash
+        env:
+          RUNNER_OS: Windows
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          tag=${GITHUB_REF_NAME}
+          case "$GITHUB_REF" in refs/tags/*) ;; *) tag="v$version" ;; esac
+          bash tools/package-desktop.sh "leoniydew-$tag-windows-x86_64" target/x86_64-pc-windows-msvc/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: leoniydew-*-windows-x86_64-no-sounds.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  # Only for a pushed tag: attaches the three files to the tag's GitHub Release.
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [android, ios, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
